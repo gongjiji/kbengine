@@ -74,6 +74,17 @@ PyObject* create_celldatadict_from_stream(MemoryStream& s, const char* entityTyp
 
 		const char* attrname = propertyDescription->getName();
 		PyObject* pyVal = propertyDescription->createFromStream(&s);
+
+		if(!propertyDescription->getDataType()->isSameType(pyVal))
+		{
+			if(pyVal)
+			{
+				Py_DECREF(pyVal);
+			}
+
+			pyVal = propertyDescription->getDataType()->parseDefaultStr("");
+		}
+
 		PyDict_SetItemString(pyDict, attrname, pyVal);
 		Py_DECREF(pyVal);
 	}
@@ -196,7 +207,7 @@ void Baseapp::onShutdown(bool first)
 			if(static_cast<Base*>(iter->second.get())->hasDB() && 
 				static_cast<Base*>(iter->second.get())->getCellMailbox() == NULL)
 			{
-				this->destroyEntity(static_cast<Base*>(iter->second.get())->getID());
+				this->destroyEntity(static_cast<Base*>(iter->second.get())->getID(), true);
 
 				count--;
 				done = true;
@@ -258,6 +269,7 @@ bool Baseapp::installPyModules()
 	APPEND_SCRIPT_MODULE_METHOD(getScript().getModule(),		reloadScript,					__py_reloadScript,											METH_VARARGS,			0);
 	APPEND_SCRIPT_MODULE_METHOD(getScript().getModule(),		isShuttingDown,					__py_isShuttingDown,										METH_VARARGS,			0);
 	APPEND_SCRIPT_MODULE_METHOD(getScript().getModule(),		address,						__py_address,												METH_VARARGS,			0);
+	APPEND_SCRIPT_MODULE_METHOD(getScript().getModule(),		deleteBaseByDBID,				__py_deleteBaseByDBID,										METH_VARARGS,			0);
 	return EntityApp<Base>::installPyModules();
 }
 
@@ -2357,6 +2369,74 @@ void Baseapp::forwardMessageToClientFromCellapp(Mercury::Channel* pChannel,
 }
 
 //-------------------------------------------------------------------------------------
+void Baseapp::forwardMessageToCellappFromCellapp(Mercury::Channel* pChannel, 
+												KBEngine::MemoryStream& s)
+{
+	if(pChannel->isExternal())
+		return;
+	
+	ENTITY_ID eid;
+	s >> eid;
+
+	Base* base = pEntities_->find(eid);
+	if(base == NULL)
+	{
+		ERROR_MSG(boost::format("Baseapp::forwardMessageToCellappFromCellapp: entityID %1% not found.\n") % eid);
+		s.opfini();
+		return;
+	}
+
+	EntityMailboxAbstract* mailbox = static_cast<EntityMailboxAbstract*>(base->getCellMailbox());
+	if(mailbox == NULL)
+	{
+		ERROR_MSG(boost::format("Baseapp::forwardMessageToCellappFromCellapp: "
+			"is error(not found cellMailbox)! entityID=%1%.\n") % 
+			eid);
+
+		s.opfini();
+		return;
+	}
+	
+	if(s.opsize() <= 0)
+		return;
+
+	Mercury::Bundle* pBundle = Mercury::Bundle::ObjPool().createObject();
+	(*pBundle).append(s);
+	mailbox->postMail((*pBundle));
+	
+	if(Mercury::g_trace_packet > 0 && s.opsize() >= sizeof(Mercury::MessageID))
+	{
+		Mercury::MessageID fmsgid = 0;
+		s >> fmsgid;
+		Mercury::MessageHandler* pMessageHandler = CellappInterface::messageHandlers.find(fmsgid);
+		bool isprint = true;
+
+		if(pMessageHandler)
+		{
+			(*pBundle).pCurrMsgHandler(pMessageHandler);
+			std::vector<std::string>::iterator iter = std::find(Mercury::g_trace_packet_disables.begin(),	
+													Mercury::g_trace_packet_disables.end(),				
+														pMessageHandler->name);							
+																											
+			if(iter != Mercury::g_trace_packet_disables.end())												
+			{																								
+				isprint = false;																			
+			}																								
+		}
+
+		if(isprint)
+		{
+			DEBUG_MSG(boost::format("Baseapp::forwardMessageToCellappFromCellapp: %1%(msgid=%2%).\n") %
+				(pMessageHandler == NULL ? "unknown" : pMessageHandler->name) % fmsgid);
+		}
+	}
+
+	s.read_skip(s.opsize());
+
+	Mercury::Bundle::ObjPool().reclaimObject(pBundle);
+}
+
+//-------------------------------------------------------------------------------------
 RemoteEntityMethod* Baseapp::createMailboxCallEntityRemoteMethod(MethodDescription* md, EntityMailbox* pMailbox)
 {
 	return new BaseRemoteMethod(md, pMailbox);
@@ -2789,7 +2869,7 @@ void Baseapp::importClientEntityDef(Mercury::Channel* pChannel)
 			const ScriptDefModule::METHODDESCRIPTION_MAP& methods1 = iter->get()->getBaseExposedMethodDescriptions();
 			const ScriptDefModule::METHODDESCRIPTION_MAP& methods2 = iter->get()->getCellExposedMethodDescriptions();
 
-			if(propers.size() == 0 && methods.size() == 0)
+			if(!iter->get()->hasClient())
 				continue;
 
 			uint16 size = propers.size() + 3/*pos, dir, spaceID*/;
@@ -2923,6 +3003,146 @@ PyObject* Baseapp::__py_address(PyObject* self, PyObject* args)
 	PyTuple_SetItem(pyobj, 0,  PyLong_FromUnsignedLong(addr.ip));
 	PyTuple_SetItem(pyobj, 1,  PyLong_FromUnsignedLong(addr.port));
 	return pyobj;
+}
+
+//-------------------------------------------------------------------------------------
+PyObject* Baseapp::__py_deleteBaseByDBID(PyObject* self, PyObject* args)
+{
+	if(PyTuple_Size(args) != 3)
+	{
+		PyErr_Format(PyExc_TypeError, "KBEngine::deleteBaseByDBID: args != (entityType, dbID, pycallback)!");
+		PyErr_PrintEx(0);
+		return NULL;
+	}
+	
+	char* entityType = NULL;
+	PyObject* pycallback = NULL;
+	DBID dbid;
+
+	if(PyArg_ParseTuple(args, "s|K|O", &entityType, &dbid, &pycallback) == -1)
+	{
+		PyErr_Format(PyExc_TypeError, "KBEngine::deleteBaseByDBID: args is error!");
+		PyErr_PrintEx(0);
+		return NULL;
+	}
+	
+	ScriptDefModule* sm = EntityDef::findScriptModule(entityType);
+	if(sm == NULL)
+	{
+		PyErr_Format(PyExc_TypeError, "KBEngine::deleteBaseByDBID: entityType(%s) not found!", entityType);
+		PyErr_PrintEx(0);
+		return NULL;
+	}
+
+	if(dbid == 0)
+	{
+		PyErr_Format(PyExc_TypeError, "KBEngine::deleteBaseByDBID: dbid is 0!");
+		PyErr_PrintEx(0);
+		return NULL;
+	}
+	
+	if(!PyCallable_Check(pycallback))
+	{
+		PyErr_Format(PyExc_TypeError, "KBEngine::deleteBaseByDBID: invalid pycallback!");
+		PyErr_PrintEx(0);
+		return NULL;
+	}
+	
+	Components::COMPONENTS& cts = Components::getSingleton().getComponents(DBMGR_TYPE);
+	Components::ComponentInfos* dbmgrinfos = NULL;
+
+	if(cts.size() > 0)
+		dbmgrinfos = &(*cts.begin());
+
+	if(dbmgrinfos == NULL || dbmgrinfos->pChannel == NULL || dbmgrinfos->cid == 0)
+	{
+		ERROR_MSG("KBEngine::deleteBaseByDBID(%1%): not found dbmgr!\n");
+		return NULL;
+	}
+
+	CALLBACK_ID callbackID = Baseapp::getSingleton().callbackMgr().save(pycallback);
+
+	Mercury::Bundle* pBundle = Mercury::Bundle::ObjPool().createObject();
+	(*pBundle).newMessage(DbmgrInterface::deleteBaseByDBID);
+	(*pBundle) << g_componentID;
+	(*pBundle) << dbid;
+	(*pBundle) << callbackID;
+	(*pBundle) << sm->getUType();
+	(*pBundle).send(Baseapp::getSingleton().getNetworkInterface(), dbmgrinfos->pChannel);
+	Mercury::Bundle::ObjPool().reclaimObject(pBundle);
+
+	S_Return;
+}
+
+//-------------------------------------------------------------------------------------
+void Baseapp::deleteBaseByDBIDCB(Mercury::Channel* pChannel, KBEngine::MemoryStream& s)
+{
+	ENTITY_ID entityID = 0;
+	COMPONENT_ID entityInAppID = 0;
+	bool success = false;
+	CALLBACK_ID callbackID;
+	DBID entityDBID;
+	ENTITY_SCRIPT_UID sid;
+
+	s >> success >> entityID >> entityInAppID >> callbackID >> sid >> entityDBID;
+
+	ScriptDefModule* sm = EntityDef::findScriptModule(sid);
+	if(sm == NULL)
+	{
+		ERROR_MSG(boost::format("Baseapp::deleteBaseByDBIDCB: entityUType(%1%) not found!\n") % sid);
+		return;
+	}
+
+	if(callbackID > 0)
+	{
+		SCOPED_PROFILE(SCRIPTCALL_PROFILE);
+
+		// true or false or mailbox
+		PyObjectPtr pyfunc = pyCallbackMgr_.take(callbackID);
+		if(pyfunc != NULL)
+		{
+			PyObject* pyval = NULL;
+			if(success)
+			{
+				pyval = Py_True;
+				Py_INCREF(pyval);
+			}
+			else if(entityID > 0 && entityInAppID > 0)
+			{
+				Base* e = static_cast<Base*>(this->findEntity(entityID));
+				if(e != NULL)
+				{
+					pyval = e;
+					Py_INCREF(pyval);
+				}
+				else
+				{
+					pyval = static_cast<EntityMailbox*>(new EntityMailbox(sm, NULL, entityInAppID, entityID, MAILBOX_TYPE_BASE));
+				}
+			}
+			else
+			{
+				pyval = Py_False;
+				Py_INCREF(pyval);
+			}
+
+			PyObject* pyResult = PyObject_CallFunction(pyfunc.get(), 
+												const_cast<char*>("O"), 
+												pyval);
+
+			if(pyResult != NULL)
+				Py_DECREF(pyResult);
+			else
+				SCRIPT_ERROR_CHECK();
+
+			Py_DECREF(pyval);
+		}
+		else
+		{
+			ERROR_MSG(boost::format("Baseapp::deleteBaseByDBIDCB: can't found callback:%1%.\n") %
+				callbackID);
+		}
+	}
 }
 
 //-------------------------------------------------------------------------------------

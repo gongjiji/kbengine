@@ -90,7 +90,7 @@ public:
 	/** 
 		通过entityID销毁一个entity 
 	*/
-	virtual bool destroyEntity(ENTITY_ID entityID);
+	virtual bool destroyEntity(ENTITY_ID entityID, bool callScript);
 
 	/**
 		由mailbox来尝试获取一个entity的实例
@@ -410,18 +410,6 @@ bool EntityApp<E>::installPyModules()
 		entryScriptFileName = PyUnicode_FromString(info.entryScriptFile);
 	}
 
-	if(entryScriptFileName != NULL)
-	{
-		entryScript_ = PyImport_Import(entryScriptFileName);
-		SCRIPT_ERROR_CHECK();
-		S_RELEASE(entryScriptFileName);
-
-		if(entryScript_.get() == NULL)
-		{
-			return false;
-		}
-	}
-
 	// 添加pywatcher支持
 	if(!initializePyWatcher(&this->getScript()))
 		return false;
@@ -474,6 +462,18 @@ bool EntityApp<E>::installPyModules()
 		ERROR_MSG( "EntityApp::installPyModules: Unable to set KBEngine.NEXT_ONLY.\n");
 	}
 	
+	if(entryScriptFileName != NULL)
+	{
+		entryScript_ = PyImport_Import(entryScriptFileName);
+		SCRIPT_ERROR_CHECK();
+		S_RELEASE(entryScriptFileName);
+
+		if(entryScript_.get() == NULL)
+		{
+			return false;
+		}
+	}
+
 	onInstallPyModules();
 	return true;
 }
@@ -643,12 +643,12 @@ void EntityApp<E>::handleGameTick()
 }
 
 template<class E>
-bool EntityApp<E>::destroyEntity(ENTITY_ID entityID)
+bool EntityApp<E>::destroyEntity(ENTITY_ID entityID, bool callScript)
 {
 	PyObjectPtr entity = pEntities_->erase(entityID);
 	if(entity != NULL)
 	{
-		static_cast<E*>(entity.get())->destroy();
+		static_cast<E*>(entity.get())->destroy(callScript);
 		return true;
 	}
 

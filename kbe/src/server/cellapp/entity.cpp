@@ -41,6 +41,7 @@ along with KBEngine.  If not, see <http://www.gnu.org/licenses/>.
 #include "navigation/navmeshex.hpp"
 
 #include "../../server/baseapp/baseapp_interface.hpp"
+#include "../../server/cellapp/cellapp_interface.hpp"
 
 #ifndef CODE_INLINE
 #include "entity.ipp"
@@ -168,22 +169,27 @@ void Entity::uninstallRangeNodes(RangeList* pRangeList)
 }
 
 //-------------------------------------------------------------------------------------
-void Entity::onDestroy(void)
+void Entity::onDestroy(bool callScript)
 {
-	SCOPED_PROFILE(SCRIPTCALL_PROFILE);
 	stopMove();
-
-	SCRIPT_OBJECT_CALL_ARGS0(this, const_cast<char*>("onDestroy"));
-
-	if(baseMailbox_ != NULL)
+	
+	if(callScript)
 	{
-		this->backupCellData();
+		SCOPED_PROFILE(SCRIPTCALL_PROFILE);
+		SCRIPT_OBJECT_CALL_ARGS0(this, const_cast<char*>("onDestroy"));
+		
+		// 如果不通知脚本， 那么也不会产生这个回调
+		// 通常销毁一个entity不通知脚本可能是迁移或者传送造成的
+		if(baseMailbox_ != NULL)
+		{
+			this->backupCellData();
 
-		Mercury::Bundle* pBundle = Mercury::Bundle::ObjPool().createObject();
-		(*pBundle).newMessage(BaseappInterface::onLoseCell);
-		(*pBundle) << id_;
-		baseMailbox_->postMail((*pBundle));
-		Mercury::Bundle::ObjPool().reclaimObject(pBundle);
+			Mercury::Bundle* pBundle = Mercury::Bundle::ObjPool().createObject();
+			(*pBundle).newMessage(BaseappInterface::onLoseCell);
+			(*pBundle) << id_;
+			baseMailbox_->postMail((*pBundle));
+			Mercury::Bundle::ObjPool().reclaimObject(pBundle);
+		}
 	}
 
 	// 将entity从场景中剔除
@@ -537,9 +543,23 @@ void Entity::addCellDataToStream(uint32 flags, MemoryStream* mstream)
 		PropertyDescription* propertyDescription = iter->second;
 		if((flags & propertyDescription->getFlags()) > 0)
 		{
+			// DEBUG_MSG(boost::format("Entity::addCellDataToStream: %1%.\n") % propertyDescription->getName());
 			PyObject* pyVal = PyDict_GetItemString(cellData, propertyDescription->getName());
 			(*mstream) << propertyDescription->getUType();
-			propertyDescription->getDataType()->addToStream(mstream, pyVal);
+
+			if(!propertyDescription->getDataType()->isSameType(pyVal))
+			{
+				ERROR_MSG(boost::format("%1%::addCellDataToStream: %2%(%3%) not is (%4%)!\n") % this->getScriptName() % 
+					propertyDescription->getName() % pyVal->ob_type->tp_name % propertyDescription->getDataType()->getName());
+				
+				PyObject* pydefval = propertyDescription->getDataType()->parseDefaultStr("");
+				propertyDescription->getDataType()->addToStream(mstream, pydefval);
+				Py_DECREF(pydefval);
+			}
+			else
+			{
+				propertyDescription->getDataType()->addToStream(mstream, pyVal);
+			}
 
 			if (PyErr_Occurred())
  			{	
@@ -1935,6 +1955,23 @@ void Entity::teleportRefEntity(Entity* entity, Position3D& pos, Direction3D& dir
 		// 否则为当前cellapp上的space， 那么我们也能够直接执行操作
 		Space* currspace = Spaces::findSpace(this->getSpaceID());
 		Space* space = Spaces::findSpace(spaceID);
+
+		// 如果要跳转的space不存在或者引用的entity是这个space的创建者且已经销毁， 那么都应该是跳转失败
+		if(space == NULL || (space->creatorID() == entity->getID() && entity->isDestroyed()))
+		{
+			if(space != NULL)
+			{
+				ERROR_MSG("Entity::teleport: nearbyEntityRef is spaceEntity, spaceEntity is destroyed!\n");
+			}
+			else
+			{
+				ERROR_MSG(boost::format("Entity::teleport: not found space(%1%)!\n") % spaceID);
+			}
+
+			onTeleportFailure();
+			return;
+		}
+
 		currspace->removeEntity(this);
 		this->setPositionAndDirection(pos, dir);
 		space->addEntityAndEnterWorld(this);
@@ -1946,17 +1983,39 @@ void Entity::teleportRefEntity(Entity* entity, Position3D& pos, Direction3D& dir
 //-------------------------------------------------------------------------------------
 void Entity::teleportRefMailbox(EntityMailbox* nearbyMBRef, Position3D& pos, Direction3D& dir)
 {
-	/* 此功能需要考虑好安全问题， 暂时不支持
-	SPACE_ID lastSpaceID = this->getSpaceID();
-	
+	// 如果这个entity有base部分， 我们需要先让base部分暂停与cell通讯， 相关信息缓存, 然后再回调到onTeleportRefMailbox。 
+	// 同时我们还需要调用一下备份功能。
+	if(this->getBaseMailbox() != NULL)
+	{
+		this->backupCellData();
+
+		// 告诉baseapp， cell正在迁移, 迁移完毕需要设置this->transferCompleted();
+		// this->transferStart();
+	}
+	else
+	{
+		onTeleportRefMailbox(nearbyMBRef, pos, dir);
+	}
+}
+
+//-------------------------------------------------------------------------------------
+void Entity::onTeleportRefMailbox(EntityMailbox* nearbyMBRef, Position3D& pos, Direction3D& dir)
+{
+	// 我们先确定目的cellapp上space存在， 之后仅需要打包entity过去创建
 	if(nearbyMBRef->isBase())
 	{
 		PyObject* pyret = PyObject_GetAttrString(nearbyMBRef, const_cast<char*>("cell"));
 		if(pyret == NULL)
+		{
+			ERROR_MSG("Entity::teleportRefMailbox: nearbyRef is error, not found cellMailbox!\n");
+			onTeleportFailure();
 			return;
+		}
 
 		if(pyret == Py_None)
 		{
+			ERROR_MSG("Entity::teleportRefMailbox: nearbyRef is error, not found cellMailbox!\n");
+			onTeleportFailure();
 			Py_DECREF(pyret);
 			return;
 		}
@@ -1968,21 +2027,75 @@ void Entity::teleportRefMailbox(EntityMailbox* nearbyMBRef, Position3D& pos, Dir
 		Py_INCREF(nearbyMBRef);
 	}
 	
-	COMPONENT_ID targetCellappID = nearbyMBRef->getComponentID();
+	if(nearbyMBRef->isCellReal())
+	{
+		Mercury::Bundle* pBundle = Mercury::Bundle::ObjPool().createObject();
+		(*pBundle).newMessage(CellappInterface::reqTeleportOtherValidation);
+		(*pBundle) << getID();
+		(*pBundle) << nearbyMBRef->getID();
+		(*pBundle) << g_componentID;
+		nearbyMBRef->postMail((*pBundle));
+		Mercury::Bundle::ObjPool().reclaimObject(pBundle);
+	}
+	else
+	{
+		Mercury::Bundle* pForwardBundle = Mercury::Bundle::ObjPool().createObject();
+		(*pForwardBundle).newMessage(CellappInterface::reqTeleportOtherValidation);
+		(*pForwardBundle) << getID();
+		(*pForwardBundle) << nearbyMBRef->getID();
+		(*pForwardBundle) << g_componentID;
 
-	Mercury::Bundle* pBundle = Mercury::Bundle::ObjPool().createObject();
-//	(*pBundle).newMessage(CellappInterface::reqTeleportOther);
-	(*pBundle) << nearbyMBRef->getID();
-	(*pBundle) << pos.x << pos.y << pos.z;
-	(*pBundle) << dir.roll() << pos.pitch() << dir.yaw();
-//	CellappInterface::reqTeleportOtherArgs3::staticAddToBundle((*pBundle), this->getID(), 
-//		g_componentID, this->getBaseMailbox()->getComponentID());
+		Mercury::Bundle* pSendBundle = Mercury::Bundle::ObjPool().createObject();
+		MERCURY_ENTITY_MESSAGE_FORWARD_CELLAPP(nearbyMBRef->getID(), (*pSendBundle), (*pForwardBundle));
 
-	nearbyMBRef->postMail((*pBundle));
-	Mercury::Bundle::ObjPool().reclaimObject(pBundle);
+		nearbyMBRef->postMail((*pSendBundle));
+		Mercury::Bundle::ObjPool().reclaimObject(pForwardBundle);
+		Mercury::Bundle::ObjPool().reclaimObject(pSendBundle);
+	}
 
 	Py_DECREF(nearbyMBRef);
-	*/
+}
+
+//-------------------------------------------------------------------------------------
+void Entity::onReqTeleportOtherAck(Mercury::Channel* pChannel, ENTITY_ID nearbyMBRefID, SPACE_ID destSpaceID)
+{
+	if(destSpaceID == 0)
+	{
+		ERROR_MSG("Entity::onReqTeleportOtherAck: not found destSpace!\n");
+		onTeleportFailure();
+		return;
+	}
+	
+	// 这里确定目的space是存在的
+	// 我们需要将entity打包发往目的cellapp， 同时需要销毁当前cellapp上的该实体
+	const Position3D& pos = getPosition();
+	const Direction3D& dir = getDirection();
+
+	Mercury::Bundle* pBundle = Mercury::Bundle::ObjPool().createObject();
+	(*pBundle).newMessage(CellappInterface::reqTeleportOther);
+	(*pBundle) << getID();
+	(*pBundle) << nearbyMBRefID;
+	(*pBundle) << this->getSpaceID() << destSpaceID;
+	(*pBundle) << this->getScriptModule()->getName();
+	(*pBundle) << pos.x << pos.y << pos.z;
+	(*pBundle) << dir.roll() << pos.pitch() << dir.yaw();
+
+	MemoryStream* s = MemoryStream::ObjPool().createObject();
+
+	addPositionAndDirectionToStream(*s);
+	(*pBundle).append(s);
+	MemoryStream::ObjPool().reclaimObject(s);
+
+	s = MemoryStream::ObjPool().createObject();
+	addCellDataToStream(ENTITY_CELL_DATA_FLAGS, s);
+	(*pBundle).append(s);
+	MemoryStream::ObjPool().reclaimObject(s);
+
+	pBundle->send(Cellapp::getSingleton().getNetworkInterface(), pChannel);
+	Mercury::Bundle::ObjPool().reclaimObject(pBundle);
+
+	// 销毁这个entity
+	Cellapp::getSingleton().destroyEntity(getID(), false);
 }
 
 //-------------------------------------------------------------------------------------
@@ -2055,6 +2168,12 @@ void Entity::teleport(PyObject_ptr nearbyMBRef, Position3D& pos, Direction3D& di
 					teleportRefMailbox(mb, pos, dir);
 				}
 			}
+			else
+			{
+				// 如果不是entity， 也不是mailbox同时也不是None? 那肯定是输入错误
+				ERROR_MSG("Entity::teleport: nearbyRef is error!\n");
+				onTeleportFailure();
+			}
 		}
 	}
 }
@@ -2062,6 +2181,7 @@ void Entity::teleport(PyObject_ptr nearbyMBRef, Position3D& pos, Direction3D& di
 //-------------------------------------------------------------------------------------
 void Entity::onTeleport()
 {
+	// 这个方法仅在base.teleport跳转之前被调用， cell.teleport是不会被调用的。
 	SCOPED_PROFILE(SCRIPTCALL_PROFILE);
 
 	SCRIPT_OBJECT_CALL_ARGS0(this, const_cast<char*>("onTeleport"));

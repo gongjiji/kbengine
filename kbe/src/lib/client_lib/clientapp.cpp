@@ -53,7 +53,7 @@ ClientApp::ClientApp(Mercury::EventDispatcher& dispatcher,
 					 Mercury::NetworkInterface& ninterface, 
 					 COMPONENT_TYPE componentType,
 					 COMPONENT_ID componentID):
-ClientObjectBase(ninterface),
+ClientObjectBase(ninterface, getScriptType()),
 TimerHandler(),
 Mercury::ChannelTimeOutHandler(),
 scriptBaseTypes_(),
@@ -174,12 +174,11 @@ bool ClientApp::installEntityDef()
 		return false;
 	}
 
-	// 注册创建entity的方法到py
-	// 向脚本注册app发布状态
-	APPEND_SCRIPT_MODULE_METHOD(getScript().getModule(),	publish,	__py_getAppPublish,		METH_VARARGS,	0)
-	APPEND_SCRIPT_MODULE_METHOD(getScript().getModule(),	fireEvent,	__py_fireEvent,			METH_VARARGS,	0)
-	APPEND_SCRIPT_MODULE_METHOD(getScript().getModule(),	player,		__py_getPlayer,			METH_VARARGS,	0)
-	
+	// 注册一些接口到kbengine
+	APPEND_SCRIPT_MODULE_METHOD(getScript().getModule(),	publish,			__py_getAppPublish,								METH_VARARGS,	0)
+	APPEND_SCRIPT_MODULE_METHOD(getScript().getModule(),	fireEvent,			__py_fireEvent,									METH_VARARGS,	0)
+	APPEND_SCRIPT_MODULE_METHOD(getScript().getModule(),	player,				__py_getPlayer,									METH_VARARGS,	0)
+	APPEND_SCRIPT_MODULE_METHOD(getScript().getModule(),	getSpaceData,		__py_GetSpaceData,								METH_VARARGS,	0)
 	return true;
 }
 
@@ -201,20 +200,6 @@ bool ClientApp::installPyModules()
 {
 	registerScript(client::Entity::getScriptType());
 	onInstallPyModules();
-
-	// 安装入口模块
-	PyObject *entryScriptFileName = PyUnicode_FromString(g_kbeConfig.entryScriptFile());
-	if(entryScriptFileName != NULL)
-	{
-		entryScript_ = PyImport_Import(entryScriptFileName);
-		SCRIPT_ERROR_CHECK();
-		S_RELEASE(entryScriptFileName);
-
-		if(entryScript_.get() == NULL)
-		{
-			return false;
-		}
-	}
 
 	// 注册设置脚本输出类型
 	APPEND_SCRIPT_MODULE_METHOD(getScript().getModule(),	scriptLogType,	__py_setScriptLogType,	METH_VARARGS,	0)
@@ -244,6 +229,21 @@ bool ClientApp::installPyModules()
 	}
 
 	registerPyObjectToScript("entities", pEntities_);
+
+	// 安装入口模块
+	PyObject *entryScriptFileName = PyUnicode_FromString(g_kbeConfig.entryScriptFile());
+	if(entryScriptFileName != NULL)
+	{
+		entryScript_ = PyImport_Import(entryScriptFileName);
+		SCRIPT_ERROR_CHECK();
+		S_RELEASE(entryScriptFileName);
+
+		if(entryScript_.get() == NULL)
+		{
+			return false;
+		}
+	}
+
 	return true;
 }
 

@@ -176,7 +176,7 @@ void ClientObjectBase::tickSend()
 }
 
 //-------------------------------------------------------------------------------------	
-bool ClientObjectBase::destroyEntity(ENTITY_ID entityID)
+bool ClientObjectBase::destroyEntity(ENTITY_ID entityID, bool callScript)
 {
 	return pEntities_->erase(entityID) != NULL;
 }
@@ -1422,6 +1422,9 @@ void ClientObjectBase::setSpaceData(Mercury::Channel* pChannel, SPACE_ID spaceID
 //-------------------------------------------------------------------------------------
 bool ClientObjectBase::hasSpaceData(const std::string& key)
 {
+	if(key.size() == 0)
+		return false;
+
 	SPACE_DATA::iterator iter = spacedatas_.find(key);
 	if(iter == spacedatas_.end())
 		return false;
